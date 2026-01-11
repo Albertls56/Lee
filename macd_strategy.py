@@ -73,16 +73,100 @@ def is_dead_cross(dif, dea):
     return dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
 
 
-def on_bar(context, bars):
-    """扫描 MACD 信号但不下单，先验证逻辑再进入交易流程。"""
-    # 先扫描信号不下单：先验逻辑验证指标与数据质量，确认信号稳定再做交易决策。
-    # DIF/DEA 代表快慢 EMA 之差及其平滑线，0 轴代表多空分界，DIF>0 表示偏多。
-    now = getattr(context, "now", None)
-    entry_candidates = []
-    exit_candidates = []
-    computed_count = 0
+def get_long_positions(context):
+    """获取当前多头持仓的 symbol 集合，兼容不同账户对象结构。"""
+    account = None
+    if hasattr(context, "account"):
+        try:
+            account = context.account()
+        except Exception:
+            account = None
+    if account is None and hasattr(context, "accounts"):
+        try:
+            accounts = context.accounts()
+            if accounts:
+                account = accounts[0]
+        except Exception:
+            account = None
+    if account is None:
+        print("未能获取账户对象，返回空持仓集合。")
+        return set()
 
-    for symbol in context.universe:
+    positions_data = None
+    for attr_name in ("positions", "position"):
+        if hasattr(account, attr_name):
+            attr = getattr(account, attr_name)
+            try:
+                positions_data = attr()
+            except Exception:
+                positions_data = attr
+            if positions_data is not None:
+                break
+    if positions_data is None and hasattr(context, "positions"):
+        try:
+            positions_data = context.positions()
+        except Exception:
+            positions_data = None
+    if positions_data is None:
+        print("未能获取持仓列表，返回空持仓集合。")
+        return set()
+
+    def is_long_side(side_value):
+        if side_value is None:
+            return True
+        if side_value == PositionSide_Long:
+            return True
+        return str(side_value).lower() in {
+            "long",
+            "positionside_long",
+            "position_side_long",
+            "positionside.long",
+        }
+
+    def extract_symbol(position):
+        if isinstance(position, dict):
+            return position.get("symbol") or position.get("security") or position.get("code")
+        return getattr(position, "symbol", None) or getattr(position, "security", None)
+
+    symbols = set()
+    if isinstance(positions_data, dict):
+        iterable = positions_data.values()
+    elif isinstance(positions_data, (list, tuple, set)):
+        iterable = positions_data
+    else:
+        iterable = [positions_data]
+    for position in iterable:
+        side_value = None
+        if isinstance(position, dict):
+            side_value = position.get("position_side") or position.get("side")
+        else:
+            side_value = getattr(position, "position_side", None) or getattr(position, "side", None)
+        if not is_long_side(side_value):
+            continue
+        symbol = extract_symbol(position)
+        if symbol:
+            symbols.add(symbol)
+    return symbols
+
+
+def on_bar(context, bars):
+    """执行可交易的沪深300 MACD 组合策略。"""
+    # on_bar 可能同一时刻收到多条 bars 推送，同一交易日只运行一次，避免重复下单。
+    now = getattr(context, "now", None)
+    if now is None and bars:
+        bar = bars[0]
+        now = getattr(bar, "eob", None) or getattr(bar, "datetime", None) or getattr(bar, "time", None)
+    trade_date = now.date() if hasattr(now, "date") else now
+    if trade_date is not None:
+        if getattr(context, "last_trade_date", None) == trade_date:
+            return
+        context.last_trade_date = trade_date
+
+    # 先卖后买：先释放资金与持仓名额，再用最新空位挑选新的进场标的。
+    held = get_long_positions(context)
+    sell_list = []
+
+    for symbol in list(held):
         data = context.data(
             symbol,
             frequency=context.frequency,
@@ -93,19 +177,54 @@ def on_bar(context, bars):
             continue
         close_series = data["close"] if isinstance(data, pd.DataFrame) else data
         dif, dea = calc_macd(close_series)
-        computed_count += 1
+        if is_dead_cross(dif, dea):
+            order_target_percent(
+                symbol,
+                0.0,
+                position_side=PositionSide_Long,
+                order_type=OrderType_Market,
+            )
+            sell_list.append(symbol)
+
+    held = held.difference(sell_list)
+    current_positions = len(held)
+
+    # 等权 + 持仓上限：每个持仓 target_weight 等权分配，最多 max_positions 只。
+    entry_candidates = []
+    for symbol in context.universe:
+        if symbol in held:
+            continue
+        data = context.data(
+            symbol,
+            frequency=context.frequency,
+            count=context.window,
+            fields="close",
+        )
+        if data is None or len(data) < context.window:
+            continue
+        close_series = data["close"] if isinstance(data, pd.DataFrame) else data
+        dif, dea = calc_macd(close_series)
         if dif.iloc[-1] > 0 and is_golden_cross(dif, dea):
             entry_candidates.append((symbol, dif.iloc[-1]))
-        if is_dead_cross(dif, dea):
-            exit_candidates.append(symbol)
 
     entry_candidates.sort(key=lambda item: item[1], reverse=True)
-    top_entry_symbols = [symbol for symbol, _ in entry_candidates[:10]]
-    top_exit_symbols = exit_candidates[:10]
+    capacity = max(context.max_positions - current_positions, 0)
+    buy_quota = min(capacity, context.max_new_positions_per_day)
+    buy_list = []
+    for symbol, _ in entry_candidates[:buy_quota]:
+        order_target_percent(
+            symbol,
+            context.target_weight,
+            position_side=PositionSide_Long,
+            order_type=OrderType_Market,
+        )
+        buy_list.append(symbol)
 
-    print(f"{now} | universe={len(context.universe)} | macd={computed_count}")
-    print(f"符合进场={len(entry_candidates)} | top10={top_entry_symbols}")
-    print(f"符合出场={len(exit_candidates)} | top10={top_exit_symbols}")
+    final_positions = current_positions + len(buy_list)
+    print(
+        f"{trade_date} | 卖出={len(sell_list)} {sell_list} | "
+        f"买入={len(buy_list)} {buy_list} | 持仓={final_positions}"
+    )
 
 
 def main():
