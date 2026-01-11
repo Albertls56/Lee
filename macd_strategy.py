@@ -4,7 +4,8 @@
 此文件仅提供项目结构示例，不包含任何交易逻辑。
 """
 
-from gm.api import get_constituents, subscribe
+from gm.api import *
+import pandas as pd
 
 # TODO: 在此处填写你的 token 与 strategy_id
 GM_TOKEN = ""
@@ -38,7 +39,7 @@ def init(context):
     context.max_new_positions_per_day = 3
     context.target_weight = 1.0 / context.max_positions
     context.frequency = "1d"
-    context.window = 35
+    context.window = 200
 
     # 股票池订阅：统一 frequency 与 window，后续再按该结构补充指标与交易逻辑。
     subscribe(
@@ -48,15 +49,63 @@ def init(context):
     )
 
 
+def calc_macd(close_series, fast=12, slow=26, signal=9):
+    """计算 MACD 指标，返回 DIF 与 DEA（白线/黄线）。"""
+    close = pd.Series(close_series).astype(float)
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    return dif, dea
+
+
+def is_golden_cross(dif, dea):
+    """判断 DIF 上穿 DEA（金叉）。"""
+    if len(dif) < 2 or len(dea) < 2:
+        return False
+    return dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
+
+
+def is_dead_cross(dif, dea):
+    """判断 DIF 下穿 DEA（死叉）。"""
+    if len(dif) < 2 or len(dea) < 2:
+        return False
+    return dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
+
+
 def on_bar(context, bars):
-    """仅打印结构信息，先搭框架再追加交易逻辑。"""
-    # 为什么先搭结构再加交易：先确认股票池与行情流畅，再逐步加入指标与下单。
+    """扫描 MACD 信号但不下单，先验证逻辑再进入交易流程。"""
+    # 先扫描信号不下单：先验逻辑验证指标与数据质量，确认信号稳定再做交易决策。
+    # DIF/DEA 代表快慢 EMA 之差及其平滑线，0 轴代表多空分界，DIF>0 表示偏多。
     now = getattr(context, "now", None)
-    first_symbol = bars[0].symbol if bars else "N/A"
-    print(
-        f"{now} | universe={len(context.universe)} | bars={len(bars)} | "
-        f"first_symbol={first_symbol}"
-    )
+    entry_candidates = []
+    exit_candidates = []
+    computed_count = 0
+
+    for symbol in context.universe:
+        data = context.data(
+            symbol,
+            frequency=context.frequency,
+            count=context.window,
+            fields="close",
+        )
+        if data is None or len(data) < context.window:
+            continue
+        close_series = data["close"] if isinstance(data, pd.DataFrame) else data
+        dif, dea = calc_macd(close_series)
+        computed_count += 1
+        if dif.iloc[-1] > 0 and is_golden_cross(dif, dea):
+            entry_candidates.append((symbol, dif.iloc[-1]))
+        if is_dead_cross(dif, dea):
+            exit_candidates.append(symbol)
+
+    entry_candidates.sort(key=lambda item: item[1], reverse=True)
+    top_entry_symbols = [symbol for symbol, _ in entry_candidates[:10]]
+    top_exit_symbols = exit_candidates[:10]
+
+    print(f"{now} | universe={len(context.universe)} | macd={computed_count}")
+    print(f"符合进场={len(entry_candidates)} | top10={top_entry_symbols}")
+    print(f"符合出场={len(exit_candidates)} | top10={top_exit_symbols}")
 
 
 def main():
